@@ -5,6 +5,259 @@ import * as aws from "./.gen/providers/aws";
 import { Construct } from "constructs";
 import { App, Fn, TerraformOutput, TerraformStack, Token } from "cdktf";
 
+class ApplicationLoadBalancer extends aws.elb.Alb {
+  public securityGroup: aws.vpc.SecurityGroup;
+  constructor(
+    scope: Construct,
+    id: string,
+    private config: aws.elb.AlbConfig & { securityGroup: aws.vpc.SecurityGroup }
+  ) {
+    super(scope, id, { ...config, securityGroups: [config.securityGroup.id] });
+    this.securityGroup = config.securityGroup;
+  }
+
+  public getService(
+    vpc: aws.vpc.Vpc,
+    port: number,
+    tags: Record<string, string>
+  ) {
+    const lbGroup = new aws.elb.LbTargetGroup(this, "client_alb_targets", {
+      namePrefix: "cl-",
+      port,
+      protocol: "HTTP",
+      vpcId: vpc.id,
+      deregistrationDelay: "30",
+      targetType: "ip",
+
+      healthCheck: {
+        enabled: true,
+        path: "/",
+        healthyThreshold: 3,
+        unhealthyThreshold: 3,
+        timeout: 30,
+        interval: 60,
+        protocol: "HTTP",
+      },
+
+      tags,
+    });
+
+    const securityGroup = new aws.vpc.SecurityGroup(
+      this,
+      "ecs_client_service",
+      {
+        namePrefix: `ecs-client-service`,
+        description: "ECS Client service security group.",
+        vpcId: vpc.id,
+      }
+    );
+
+    new aws.vpc.SecurityGroupRule(this, "ecs_client_service_allow_port", {
+      securityGroupId: securityGroup.id,
+      type: "ingress",
+      protocol: "tcp",
+      fromPort: port,
+      toPort: port,
+      sourceSecurityGroupId: this.securityGroup.id,
+      description:
+        "Allow incoming traffic from the client ALB into the service container port",
+    });
+
+    new aws.elb.LbListener(this, "client_alb_http_80", {
+      loadBalancerArn: this.arn,
+      port: 80,
+      protocol: "HTTP",
+
+      defaultAction: [
+        {
+          type: "forward",
+          targetGroupArn: lbGroup.arn,
+        },
+      ],
+    });
+    new aws.vpc.SecurityGroupRule(
+      this,
+      "ecs_client_service_allow_inbound_self",
+      {
+        securityGroupId: securityGroup.id,
+        type: "ingress",
+        protocol: "-1",
+        selfAttribute: true,
+        fromPort: 0,
+        toPort: 0,
+        description: "Allow traffic from resources with this security group",
+      }
+    );
+
+    new aws.vpc.SecurityGroupRule(this, "ecs_client_service_allow_outbound", {
+      securityGroupId: securityGroup.id,
+      type: "egress",
+      protocol: "-1",
+      fromPort: 0,
+      toPort: 0,
+      cidrBlocks: ["0.0.0.0/0"],
+      ipv6CidrBlocks: ["::/0"],
+      description: "Allow any outbound traffic.",
+    });
+
+    return {
+      securityGroup,
+      lbGroup,
+    };
+  }
+}
+
+class TrafficControl extends Construct {
+  public publicSubnets: aws.vpc.Subnet[];
+  public privateSubnets: aws.vpc.Subnet[];
+
+  private publicRouteTable?: aws.vpc.RouteTable;
+  private privateRouteTable?: aws.vpc.RouteTable;
+
+  constructor(
+    scope: Construct,
+    private id: string,
+    private vpc: aws.vpc.Vpc,
+    private zones: string[]
+  ) {
+    super(scope, id);
+
+    this.publicSubnets = zones.map((az, index) => {
+      return new aws.vpc.Subnet(this, "public_subnet_" + az, {
+        assignIpv6AddressOnCreation: true,
+        availabilityZone: az,
+        cidrBlock: Fn.cidrsubnet(this.vpc.cidrBlock, 4, index),
+        ipv6CidrBlock: Fn.cidrsubnet(this.vpc.ipv6CidrBlock, 8, index),
+        mapPublicIpOnLaunch: true,
+        tags: this.vpc.tagsInput,
+        vpcId: this.vpc.id,
+      });
+    });
+
+    this.privateSubnets = zones.map((az, index) => {
+      return new aws.vpc.Subnet(this, "private_subnet_" + az, {
+        availabilityZone: az,
+        cidrBlock: Fn.cidrsubnet(
+          this.vpc.cidrBlock,
+          4,
+          index + this.publicSubnets.length
+        ),
+        tags: this.vpc.tagsInput,
+        vpcId: this.vpc.id,
+      });
+    });
+  }
+
+  public addPrivateInternetAccess() {
+    const awsEipNat = new aws.ec2.Eip(this, "nat", {
+      tags: this.vpc.tagsInput,
+      vpc: true,
+    });
+    const awsNatGatewayNat = new aws.vpc.NatGateway(this, "nat_14", {
+      allocationId: awsEipNat.id,
+      dependsOn: [awsEipNat],
+      subnetId: this.publicSubnets[0].id,
+      tags: this.vpc.tagsInput,
+    });
+
+    const awsRouteTablePrivate = new aws.vpc.RouteTable(this, "private", {
+      tags: this.vpc.tagsInput,
+      vpcId: this.vpc.id,
+    });
+
+    this.privateSubnets.forEach((subnet) => {
+      new aws.vpc.RouteTableAssociation(
+        this,
+        `route_table_association_${subnet.availabilityZoneInput}`,
+        {
+          routeTableId: awsRouteTablePrivate.id,
+          subnetId: subnet.id,
+        }
+      );
+    });
+
+    new aws.vpc.Route(this, "private_internet_access", {
+      destinationCidrBlock: "0.0.0.0/0",
+      natGatewayId: awsNatGatewayNat.id,
+      routeTableId: awsRouteTablePrivate.id,
+    });
+
+    this.privateRouteTable = awsRouteTablePrivate;
+  }
+
+  createPublicAlb() {
+    const clientAlbSG = new aws.vpc.SecurityGroup(
+      this,
+      "client_alb_security_group",
+      {
+        namePrefix: `${this.id}-ecs-client-alb`,
+        description:
+          "security group for client service application load balancer",
+        vpcId: this.vpc.id,
+      }
+    );
+
+    new aws.vpc.SecurityGroupRule(this, "client_alb_allow_80", {
+      securityGroupId: clientAlbSG.id,
+      type: "ingress",
+      protocol: "tcp",
+      fromPort: 80,
+      toPort: 80,
+      cidrBlocks: ["0.0.0.0/0"],
+      ipv6CidrBlocks: ["::/0"],
+      description: "Allow HTTP traffic",
+    });
+
+    new aws.vpc.SecurityGroupRule(this, "client_alb_allow_outbound", {
+      securityGroupId: clientAlbSG.id,
+      type: "egress",
+      protocol: "-1",
+      fromPort: 0,
+      toPort: 0,
+      cidrBlocks: ["0.0.0.0/0"],
+      ipv6CidrBlocks: ["::/0"],
+      description: "Allow any outbound traffic",
+    });
+
+    const awsRouteTablePublic = new aws.vpc.RouteTable(this, "public", {
+      tags: this.vpc.tagsInput,
+      vpcId: this.vpc.id,
+    });
+
+    const awsInternetGatewayGw = new aws.vpc.InternetGateway(this, "gw", {
+      tags: this.vpc.tagsInput,
+      vpcId: this.vpc.id,
+    });
+
+    new aws.vpc.Route(this, "public_internet_access", {
+      destinationCidrBlock: "0.0.0.0/0",
+      gatewayId: awsInternetGatewayGw.id,
+      routeTableId: awsRouteTablePublic.id,
+    });
+
+    this.publicSubnets.forEach((subnet) => {
+      new aws.vpc.RouteTableAssociation(
+        this,
+        `public_route_table_association_${subnet.availabilityZoneInput}`,
+        {
+          routeTableId: awsRouteTablePublic.id,
+          subnetId: subnet.id,
+        }
+      );
+    });
+
+    return new ApplicationLoadBalancer(this, "client_alb", {
+      securityGroup: clientAlbSG,
+      namePrefix: "cl-",
+      loadBalancerType: "application",
+      subnets: this.publicSubnets.map((subnet) => subnet.id),
+      idleTimeout: 60,
+      ipAddressType: "dualstack",
+      tags: this.vpc.tagsInput,
+    });
+  }
+}
+
 class MyStack extends TerraformStack {
   constructor(scope: Construct, name: string) {
     super(scope, name);
@@ -37,12 +290,6 @@ class MyStack extends TerraformStack {
       region: region,
     });
 
-    const awsEipNat = new aws.ec2.Eip(this, "nat", {
-      tags: {
-        Name: `${projectName}-nat-eip`,
-      },
-      vpc: true,
-    });
     const awsVpcMain = new aws.vpc.Vpc(this, "main", {
       assignGeneratedIpv6CidrBlock: true,
       cidrBlock: vpcCidr.value,
@@ -56,123 +303,21 @@ class MyStack extends TerraformStack {
 
     const availabilityZones = ["a", "b", "c"].map((zone) => `${region}${zone}`);
 
-    const awsInternetGatewayGw = new aws.vpc.InternetGateway(this, "gw", {
-      tags: {
-        Name: `${projectName}-internet-gateway`,
-      },
-      vpcId: awsVpcMain.id,
-    });
-    const awsRouteTablePrivate = new aws.vpc.RouteTable(this, "private", {
-      tags: {
-        Name: `${projectName}-private-route-table`,
-      },
-      vpcId: awsVpcMain.id,
-    });
-    const awsRouteTablePublic = new aws.vpc.RouteTable(this, "public", {
-      tags: {
-        Name: `${projectName}-public-route-table`,
-      },
-      vpcId: awsVpcMain.id,
-    });
-
-    const publicSubnets = availabilityZones.map((az, index) => {
-      return new aws.vpc.Subnet(this, "public_subnet_" + az, {
-        assignIpv6AddressOnCreation: true,
-        availabilityZone: az,
-        cidrBlock: Fn.cidrsubnet(awsVpcMain.cidrBlock, 4, index),
-        ipv6CidrBlock: Fn.cidrsubnet(awsVpcMain.ipv6CidrBlock, 8, index),
-        mapPublicIpOnLaunch: true,
-        tags: {
-          Name: `${projectName}-public-${az}`,
-        },
-        vpcId: awsVpcMain.id,
-      });
-    });
-
-    const privateSubnets = availabilityZones.map((az, index) => {
-      return new aws.vpc.Subnet(this, "private_subnet_" + az, {
-        availabilityZone: az,
-        cidrBlock: Fn.cidrsubnet(
-          awsVpcMain.cidrBlock,
-          4,
-          index + publicSubnets.length
-        ),
-        tags: {
-          Name: `${projectName}-private-${az}`,
-        },
-        vpcId: awsVpcMain.id,
-      });
-    });
-
-    const awsNatGatewayNat = new aws.vpc.NatGateway(this, "nat_14", {
-      allocationId: awsEipNat.id,
-      dependsOn: [awsEipNat, awsInternetGatewayGw],
-      subnetId: publicSubnets[0].id,
-      tags: {
-        Name: `${projectName}-nat`,
-      },
-    });
-
-    awsNatGatewayNat.overrideLogicalId("nat");
-    new aws.vpc.Route(this, "private_internet_access", {
-      destinationCidrBlock: "0.0.0.0/0",
-      natGatewayId: awsNatGatewayNat.id,
-      routeTableId: awsRouteTablePrivate.id,
-    });
-    new aws.vpc.Route(this, "public_internet_access", {
-      destinationCidrBlock: "0.0.0.0/0",
-      gatewayId: awsInternetGatewayGw.id,
-      routeTableId: awsRouteTablePublic.id,
-    });
-
-    privateSubnets.forEach((subnet) => {
-      new aws.vpc.RouteTableAssociation(
-        this,
-        `route_table_association_${subnet.availabilityZoneInput}`,
-        {
-          routeTableId: awsRouteTablePrivate.id,
-          subnetId: subnet.id,
-        }
-      );
-    });
-
-    publicSubnets.forEach((subnet) => {
-      new aws.vpc.RouteTableAssociation(
-        this,
-        `public_route_table_association_${subnet.availabilityZoneInput}`,
-        {
-          routeTableId: awsRouteTablePrivate.id,
-          subnetId: subnet.id,
-        }
-      );
+    const tc = new TrafficControl(
+      this,
+      "traffic",
+      awsVpcMain,
+      availabilityZones
+    );
+    tc.addPrivateInternetAccess();
+    const alb = tc.createPublicAlb();
+    const service = alb.getService(awsVpcMain, 9090, {
+      Name: `${Fn.lookup(defaultTags.value, "project", "")}-service`,
     });
 
     // Part 2
     const cluster = new aws.ecs.EcsCluster(this, "cluster", {
       name: `${projectName}-cluster`,
-    });
-
-    const lbGroup = new aws.elb.LbTargetGroup(this, "client_alb_targets", {
-      namePrefix: "cl-",
-      port: 9090,
-      protocol: "HTTP",
-      vpcId: awsVpcMain.id,
-      deregistrationDelay: "30",
-      targetType: "ip",
-
-      healthCheck: {
-        enabled: true,
-        path: "/",
-        healthyThreshold: 3,
-        unhealthyThreshold: 3,
-        timeout: 30,
-        interval: 60,
-        protocol: "HTTP",
-      },
-
-      tags: {
-        Name: `${projectName}-client-tg`,
-      },
     });
 
     const taskDefinition = new aws.ecs.EcsTaskDefinition(
@@ -214,109 +359,6 @@ class MyStack extends TerraformStack {
       }
     );
 
-    const clientAlbSG = new aws.vpc.SecurityGroup(
-      this,
-      "client_alb_security_group",
-      {
-        namePrefix: `${projectName}-ecs-client-alb`,
-        description:
-          "security group for client service application load balancer",
-        vpcId: awsVpcMain.id,
-      }
-    );
-
-    new aws.vpc.SecurityGroupRule(this, "client_alb_allow_80", {
-      securityGroupId: clientAlbSG.id,
-      type: "ingress",
-      protocol: "tcp",
-      fromPort: 80,
-      toPort: 80,
-      cidrBlocks: ["0.0.0.0/0"],
-      ipv6CidrBlocks: ["::/0"],
-      description: "Allow HTTP traffic",
-    });
-
-    new aws.vpc.SecurityGroupRule(this, "client_alb_allow_outbound", {
-      securityGroupId: clientAlbSG.id,
-      type: "egress",
-      protocol: "-1",
-      fromPort: 0,
-      toPort: 0,
-      cidrBlocks: ["0.0.0.0/0"],
-      ipv6CidrBlocks: ["::/0"],
-      description: "Allow any outbound traffic",
-    });
-
-    const alb = new aws.elb.Alb(this, "client_alb", {
-      namePrefix: "cl-",
-      loadBalancerType: "application",
-      securityGroups: [clientAlbSG.id],
-      subnets: publicSubnets.map((subnet) => subnet.id),
-      idleTimeout: 60,
-      ipAddressType: "dualstack",
-      tags: {
-        Name: `${projectName}-client-alb`,
-      },
-    });
-    new aws.elb.LbListener(this, "client_alb_http_80", {
-      loadBalancerArn: alb.arn,
-      port: 80,
-      protocol: "HTTP",
-
-      defaultAction: [
-        {
-          type: "forward",
-          targetGroupArn: lbGroup.arn,
-        },
-      ],
-    });
-
-    const clientServiceSG = new aws.vpc.SecurityGroup(
-      this,
-      "ecs_client_service",
-      {
-        namePrefix: `${projectName}-ecs-client-service`,
-        description: "ECS Client service security group.",
-        vpcId: awsVpcMain.id,
-      }
-    );
-
-    new aws.vpc.SecurityGroupRule(this, "ecs_client_service_allow_9090", {
-      securityGroupId: clientServiceSG.id,
-      type: "ingress",
-      protocol: "tcp",
-      fromPort: 9090,
-      toPort: 9090,
-      sourceSecurityGroupId: clientAlbSG.id,
-      description:
-        "Allow incoming traffic from the client ALB into the service container port",
-    });
-
-    new aws.vpc.SecurityGroupRule(
-      this,
-      "ecs_client_service_allow_inbound_self",
-      {
-        securityGroupId: clientServiceSG.id,
-        type: "ingress",
-        protocol: "-1",
-        selfAttribute: true,
-        fromPort: 0,
-        toPort: 0,
-        description: "Allow traffic from resources with this security group",
-      }
-    );
-
-    new aws.vpc.SecurityGroupRule(this, "ecs_client_service_allow_outbound", {
-      securityGroupId: clientServiceSG.id,
-      type: "egress",
-      protocol: "-1",
-      fromPort: 0,
-      toPort: 0,
-      cidrBlocks: ["0.0.0.0/0"],
-      ipv6CidrBlocks: ["::/0"],
-      description: "Allow any outbound traffic.",
-    });
-
     new aws.ecs.EcsService(this, "client", {
       name: `${projectName}-client`,
       cluster: cluster.arn,
@@ -326,17 +368,17 @@ class MyStack extends TerraformStack {
 
       loadBalancer: [
         {
-          targetGroupArn: lbGroup.arn,
+          targetGroupArn: service.lbGroup.arn,
           containerName: "client",
           containerPort: 9090,
         },
       ],
 
       networkConfiguration: {
-        subnets: privateSubnets.map((sub) => sub.id),
+        subnets: tc.privateSubnets.map((sub) => sub.id),
         assignPublicIp: false,
 
-        securityGroups: [clientServiceSG.id],
+        securityGroups: [service.securityGroup.id],
       },
     });
 
