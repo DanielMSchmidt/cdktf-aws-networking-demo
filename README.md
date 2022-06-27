@@ -2,6 +2,12 @@
 
 This is a port of parts 1 and 2 from [hashicorp/microservices-architecture-on-aws](https://github.com/hashicorp/microservices-architecture-on-aws/tree/part-2), adapted for CDKTF.
 
+## Summary
+
+- [Part 1: Port of the Terraform Code](https://github.com/DanielMSchmidt/cdktf-aws-networking-demo/tree/part-1)
+- [Part 2: Refactoring into Constructs](https://github.com/DanielMSchmidt/cdktf-aws-networking-demo/tree/part-2)
+- [Part 3: Using the AWS Adapter](https://github.com/DanielMSchmidt/cdktf-aws-networking-demo/tree/part-3)
+
 ## The Architecture
 
 We implement roughly this architecture:
