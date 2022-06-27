@@ -61,3 +61,10 @@ Here is the workflow when you run `cdktf deploy cdktf-aws-networking-demo` as a 
 ### Converting from Terraform to CDKTF
 
 To help people convert documentation or their code base over to CDKTF, we have the [`cdktf convert`](https://www.terraform.io/cdktf/cli-reference/commands#convert) command. It will convert your Terraform code to CDKTF code. There might be some differences in the generated code, but most of the time it should be pretty close.
+
+### Refactoring into Constructs
+
+The Terraform CDK does not come with a lot of built-in constructs, so we need to create our own.
+Users can create abstractions for their own use-cases using `Constructs` and be creative in their structure. The can use methods / closures / constructors to create their own constructs and configure behaviour.
+
+Constructs can be used internally through file references, but they can also be distributed. [You can use the CDKTF projen construct](https://github.com/projen/projen/blob/main/src/cdktf/cdktf-construct.ts#L28) to generate a GitHub project for distributing your own CDKTF constructs. If you want to share your code both as constructs and as Terraform Modules you should take a look at [`https://github.com/DanielMSchmidt/projen-cdktf-hybrid-construct/`](https://github.com/DanielMSchmidt/projen-cdktf-hybrid-construct/), there is also a [CDK Day talk about it](https://www.youtube.com/watch?v=s8tO-ymVQPg&t=10267s).
