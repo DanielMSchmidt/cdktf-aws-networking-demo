@@ -11,7 +11,7 @@ This is a port of parts 1 and 2 from [hashicorp/microservices-architecture-on-aw
 
 We implement roughly this architecture:
 
-![architecture](https://github.com/hashicorp/microservices-architecture-on-aws/raw/main/images/aws-consul-ecs-finalized-architecture.png)
+![Architecture](https://github.com/hashicorp/microservices-architecture-on-aws/raw/main/images/aws-consul-ecs-finalized-architecture.png)
 
 We create a VPC with private and public subnets and use a gateway to expose traffic from our ECS cluster to the internet.
 
@@ -31,7 +31,17 @@ Run the following command to get started:
 
 ## Walkthrough
 
-This walkthrough should give you a high level overview of CDKTF, especially coming from the AWS CDK. For more in-depth information, please refer to the [Terraform CDK documentation](https://www.terraform.io/cdktf).
+This walkthrough should give you a high level overview of CDKTF, especially coming from the AWS CDK or Terraform. For more in-depth information, please refer to the [Terraform CDK documentation](https://www.terraform.io/cdktf).
+
+### Coming from Terraform
+
+CDKTF does not come with it's own language but works with a few imperative programming languages instead: Typescript, Python, Java, C#, Go. Instead of variable / output / resource / data source blocks a CDKTF program consists of Constructs. [Constructs](https://github.com/aws/constructs) is a framework to build a graph that builds the desired state. CDKTF takes this graph and builds Terraform code from it. The Constructs you can use in CDKTF programs come from the CDKTF core library, third party packages, or are generated bindings based on the Terraform Provider schema. You can use Constructs [to build logical components, see part 2](https://github.com/DanielMSchmidt/cdktf-aws-networking-demo/tree/part-2). To instanciate a Construct you have to pass the scope (which is the parent), a unique identifier within this scope, and whatever properties this specific Construct requires.
+
+A special construct is the `TerraformStack`, which maps roughly to a Terraform workspace. CDKTF can handle multiple stacks and even build connections between them automatically; they are resolved through `RemoteStateDataSources` and we call them [Cross Stack References](https://www.terraform.io/cdktf/concepts/stacks#cross-stack-references). The CDKTF CLI can be used to deploy / destroy multiple in parallel.
+
+### Coming from AWS CDK
+
+The concept of AWS CDK and CDKTF is very similar. The main difference is that CDKTF synthesizes the code into Terraform instead of CloudFormation, meaning CDKTF can be used to build infrastructure on any platform with a Terraform provider. Since we have a much broader spectrum of things to support we have only few L2 / L3 constructs in place. Instead we focus much more on making the generated L1 constructs great and provide a good UX that way. We also work on an [AWS CDK Adapter](https://www.terraform.io/cdktf/create-and-deploy/aws-adapter) that lets you use AWS CDK Constructs within your CDKTF program seemlessly, it's currently in technical preview.
 
 ### Provider bindings
 
